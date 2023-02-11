@@ -80,7 +80,36 @@ const fetcher = (variables, token) => {
   const query = !variables.after ? GRAPHQL_STATS_QUERY : GRAPHQL_REPOS_QUERY;
   return request(
     {
-      query,
+      query: `
+      query userInfo($login: String!, $ownerAffiliations: [RepositoryAffiliation]) {
+        user(login: $login) {
+          name
+          login
+          contributionsCollection {
+            totalCommitContributions
+            restrictedContributionsCount
+          }
+          repositoriesContributedTo(contributionTypes: [COMMIT, ISSUE, PULL_REQUEST, REPOSITORY]) {
+            totalCount
+          }
+          pullRequests {
+            totalCount
+          }
+          openIssues: issues(states: OPEN) {
+            totalCount
+          }
+          closedIssues: issues(states: CLOSED) {
+            totalCount
+          }
+          followers {
+            totalCount
+          }
+          repositories(ownerAffiliations: $ownerAffiliations) {
+            totalCount
+          }
+        }
+      }
+      `,
       variables,
     },
     {
@@ -98,40 +127,33 @@ const fetcher = (variables, token) => {
  *
  * @description This function supports multi-page fetching if the 'FETCH_MULTI_PAGE_STARS' environment variable is set to true.
  */
-const statsFetcher = async (username, ownerAffiliations) => {
-  let stats;
-  let hasNextPage = true;
-  let endCursor = null;
-  while (hasNextPage) {
-    const variables = {
-      login: username,
-      first: 100,
-      after: endCursor,
-      ownerAffiliations: ownerAffiliations,
-    };
-    let res = await retryer(fetcher, variables);
-    if (res.data.errors) return res;
-
-    // Store stats data.
-    const repoNodes = res.data.data.user.repositories.nodes;
-    if (!stats) {
-      stats = res;
-    } else {
-      stats.data.data.user.repositories.nodes.push(...repoNodes);
-    }
-
-    // Disable multi page fetching on public Vercel instance due to rate limits.
-    const repoNodesWithStars = repoNodes.filter(
-      (node) => node.stargazers.totalCount !== 0,
-    );
-    hasNextPage =
-      process.env.FETCH_MULTI_PAGE_STARS === "true" &&
-      repoNodes.length === repoNodesWithStars.length &&
-      res.data.data.user.repositories.pageInfo.hasNextPage;
-    endCursor = res.data.data.user.repositories.pageInfo.endCursor;
-  }
-
-  return stats;
+const repositoriesFetcher = (variables, token) => {
+  return request(
+    {
+      query: `
+      query userInfo($login: String!, $after: String, $ownerAffiliations: [RepositoryAffiliation]) {
+        user(login: $login) {
+          repositories(first: 100, ownerAffiliations: $ownerAffiliations, orderBy: {direction: DESC, field: STARGAZERS}, after: $after) {
+            nodes {
+              name
+              stargazers {
+                totalCount
+              }
+            }
+            pageInfo {
+              hasNextPage
+              endCursor
+            }
+          }
+        }
+      }
+      `,
+      variables,
+    },
+    {
+      Authorization: `bearer ${token}`,
+    },
+  );
 };
 
 /**
@@ -177,19 +199,65 @@ const totalCommitsFetcher = async (username) => {
 };
 
 /**
+ * Fetch all the stars for all the repositories of a given username.
+ *
+ * @param {string} username GitHub username.
+ * @param {boolean} include_orgs Include stats from organization repos.
+ * @param {array} repoToHide Repositories to hide.
+ * @returns {Promise<number>} Total stars.
+ */
+const totalStarsFetcher = async (username, include_orgs, repoToHide) => {
+  let nodes = [];
+  let hasNextPage = true;
+  let endCursor = null;
+  while (hasNextPage) {
+    const variables = {
+      login: username,
+      first: 100,
+      after: endCursor,
+      ownerAffiliations: include_orgs ? ["OWNER", "COLLABORATOR"] : ["OWNER"],
+    };
+    let res = await retryer(repositoriesFetcher, variables);
+
+    if (res.data.errors) {
+      logger.error(res.data.errors);
+      throw new CustomError(
+        res.data.errors[0].message || "Could not fetch user",
+        CustomError.USER_NOT_FOUND,
+      );
+    }
+
+    const allNodes = res.data.data.user.repositories.nodes;
+    const nodesWithStars = allNodes.filter(
+      (node) => node.stargazers.totalCount !== 0,
+    );
+    nodes.push(...nodesWithStars);
+    // hasNextPage =
+    //   allNodes.length === nodesWithStars.length &&
+    //   res.data.data.user.repositories.pageInfo.hasNextPage;
+    hasNextPage = false; // NOTE: Temporarily disable fetching of multiple pages. Done because of #2130.
+    endCursor = res.data.data.user.repositories.pageInfo.endCursor;
+  }
+
+  return nodes
+    .filter((data) => !repoToHide[data.name])
+    .reduce((prev, curr) => prev + curr.stargazers.totalCount, 0);
+};
+
+/**
  * Fetch stats for a given username.
  *
  * @param {string} username GitHub username.
  * @param {boolean} count_private Include private contributions.
  * @param {boolean} include_all_commits Include all commits.
- * @param {string[]} exclude_repo Repositories to exclude.  Default: [].
- * @param {string[]} ownerAffiliations Owner affiliations. Default: OWNER.
+ * @param {boolean} include_orgs Include stats from organization repos.
  * @returns {Promise<import("./types").StatsData>} Stats data.
  */
 const fetchStats = async (
   username,
   count_private = false,
   include_all_commits = false,
+  include_orgs = false,
   exclude_repo = [],
   ownerAffiliations = [],
 ) => {
@@ -206,7 +274,10 @@ const fetchStats = async (
   };
   ownerAffiliations = parseOwnerAffiliations(ownerAffiliations);
 
-  let res = await statsFetcher(username, ownerAffiliations);
+  let res = await retryer(fetcher, {
+    login: username,
+    ownerAffiliations: include_orgs ? ["OWNER", "COLLABORATOR"] : ["OWNER"],
+  });
 
   // Catch GraphQL errors.
   if (res.data.errors) {
@@ -262,13 +333,11 @@ const fetchStats = async (
   stats.contributedTo = user.repositoriesContributedTo.totalCount;
 
   // Retrieve stars while filtering out repositories to be hidden
-  stats.totalStars = user.repositories.nodes
-    .filter((data) => {
-      return !repoToHide[data.name];
-    })
-    .reduce((prev, curr) => {
-      return prev + curr.stargazers.totalCount;
-    }, 0);
+  stats.totalStars = await totalStarsFetcher(
+    username,
+    include_orgs,
+    repoToHide,
+  );
 
   // @ts-ignore // TODO: Fix this.
   stats.rank = calculateRank({

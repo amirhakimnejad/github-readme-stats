@@ -24,6 +24,7 @@ export default async (req, res) => {
     cache_seconds,
     layout,
     langs_count,
+    include_orgs,
     exclude_repo,
     custom_title,
     locale,
@@ -46,6 +47,7 @@ export default async (req, res) => {
   try {
     const topLangs = await fetchTopLanguages(
       username,
+      include_orgs,
       parseArray(exclude_repo),
       parseArray(role),
     );
